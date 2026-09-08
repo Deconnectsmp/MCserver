@@ -1465,19 +1465,35 @@ const supabaseClient = supabase.createClient(
         created_at timestamptz not null default now()
     );
 
-    -- allow the login form (anon key) to insert new submissions:
     alter table submissions enable row level security;
 
+    -- allow the login form (anon key) to insert new submissions:
     create policy "anyone can insert a submission"
         on submissions for insert
         to anon
         with check (true);
 
-    -- only allow reading submissions back out for admins.
-    -- with the anon key alone there is no real "admin" identity,
-    -- so if you need this locked server-side, read submissions
-    -- through a server function / service-role key instead of
-    -- straight from the browser.
+    -- THIS POLICY WAS MISSING. That's the actual bug: with RLS on and
+    -- no SELECT policy, every read from the browser (the anon key
+    -- this page uses) was silently rejected by Postgres, so inserts
+    -- kept succeeding while the "Login Submissions" table stayed
+    -- empty.
+    --
+    -- With the anon key alone there is no real "admin" identity, so
+    -- this has to allow the anon role to read — the same limitation
+    -- the EDIT_PASSWORD check already has. Anyone who calls the
+    -- Supabase REST API directly with this project's anon key can
+    -- read submissions, bypassing the password gate in this file.
+    -- If you need that locked server-side instead, read submissions
+    -- through a server function / service-role key and remove this
+    -- policy.
+    create policy "anon can read submissions"
+        on submissions for select
+        to anon
+        using (true);
+
+    -- required for the live auto-refresh while Edit Mode is open:
+    alter publication supabase_realtime add table submissions;
 */
 
 
@@ -1636,13 +1652,29 @@ async function insertSubmission(submission) {
 
         if (error) throw error;
 
+        // If an admin already has Edit Mode open in this same browser
+        // tab, refresh the submissions list right away so the new
+        // entry shows up without having to close/reopen Edit Mode.
+        // (For other browsers/tabs, the realtime subscription set up
+        // in subscribeToSubmissions() handles the refresh instead.)
+        if (editing) {
+
+            await loadSubmissions();
+
+            renderSubmissions();
+
+        }
+
     } catch (error) {
 
         console.error("Supabase submission error:", error);
 
         // Don't block the player from entering just because the
         // admin-only log failed to save.
-        showToast("⚠️ Could not save your submission info");
+        showToast(
+            "⚠️ Could not save your submission info" +
+            (error && error.message ? ": " + error.message : "")
+        );
 
     }
 
@@ -1667,9 +1699,68 @@ async function loadSubmissions() {
 
         submissions = [];
 
-        showToast("⚠️ Could not load submissions");
+        // Surface the real Supabase/Postgres error (e.g. an RLS
+        // "permission denied for table submissions" message) so it's
+        // obvious in the UI, not just buried in the console. This is
+        // almost always an RLS SELECT policy issue — see the SQL
+        // notes near the top of this file.
+        showToast(
+            "⚠️ Could not load submissions" +
+            (error && error.message ? ": " + error.message : "")
+        );
 
     }
+
+}
+
+/*
+    Realtime: push new submissions into an already-open Edit Mode
+    session automatically — e.g. another player logs in on a
+    different device/tab while you're looking at the Submissions
+    table. Requires the "submissions" table to be added to the
+    supabase_realtime publication (see the SQL notes above).
+*/
+let submissionsChannel = null;
+
+function subscribeToSubmissions() {
+
+    if (submissionsChannel) return;
+
+    submissionsChannel = supabaseClient
+        .channel("submissions-changes")
+        .on(
+            "postgres_changes",
+            {
+                event: "INSERT",
+                schema: "public",
+                table: "submissions"
+            },
+            async () => {
+
+                // Only bother refreshing/rendering if the admin is
+                // actually looking at Edit Mode right now.
+                if (!editing) return;
+
+                await loadSubmissions();
+
+                renderSubmissions();
+
+                showToast("🔔 New submission received");
+
+            }
+        )
+        .subscribe((status, error) => {
+
+            if (status === "CHANNEL_ERROR" || error) {
+
+                console.error(
+                    "Supabase realtime error (submissions):",
+                    error || status
+                );
+
+            }
+
+        });
 
 }
 
@@ -1827,6 +1918,10 @@ async function showWebsite() {
 
     renderAll();
 
+    // Start listening for new submissions so Edit Mode can
+    // auto-refresh if it's already open when someone else logs in.
+    subscribeToSubmissions();
+
 }
 
 
@@ -1914,6 +2009,11 @@ async function verifyEditPassword() {
     await loadSubmissions();
 
     renderSubmissions();
+
+    // Make sure the realtime listener is active so any submissions
+    // that come in while this Edit Mode session stays open get
+    // picked up automatically.
+    subscribeToSubmissions();
 
 }
 
